@@ -323,21 +323,24 @@ def carregar_template(nome_template: str):
 # ---------------------------------------------------------------------------
 
 def imprimir(texto: str, nome_impressora: str, encoding: str = "cp850") -> None:
-    if not nome_impressora or nome_impressora.lower() == "default":
-        nome_impressora = win32print.GetDefaultPrinter()
+    # 1. Salva o texto em um arquivo .txt fisico
+    nome_arquivo = f"comanda_{int(time.time())}.txt"
+    caminho_txt = PROCESSADOS_DIR / nome_arquivo
+    
+    with open(caminho_txt, "w", encoding=encoding, errors="replace") as f:
+        f.write(texto)
+        
+    logger.info("Comanda salva em: %s", caminho_txt)
 
-    handle = win32print.OpenPrinter(nome_impressora)
-    try:
-        win32print.StartDocPrinter(handle, 1, ("Comanda AutoComanda", None, "RAW"))
-        try:
-            win32print.StartPagePrinter(handle)
-            dados = texto.encode(encoding, errors="replace")
-            win32print.WritePrinter(handle, dados)
-            win32print.EndPagePrinter(handle)
-        finally:
-            win32print.EndDocPrinter(handle)
-    finally:
-        win32print.ClosePrinter(handle)
+    # 2. Envia o .txt para a impressora pelo Windows
+    # Usa o Notepad para imprimir o arquivo texto de forma silenciosa
+    import subprocess
+    if not nome_impressora or nome_impressora.lower() == "default":
+        # Imprime na impressora padrao
+        os.startfile(str(caminho_txt), "print")
+    else:
+        # Imprime em impressora especifica
+        subprocess.run(["notepad.exe", "/pt", str(caminho_txt), nome_impressora], check=True)
 
 
 # ---------------------------------------------------------------------------
