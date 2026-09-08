@@ -3,7 +3,8 @@ Template padrao de comanda para impressoras termicas de 48 colunas.
 
 Implementa a assinatura exigida pelo motor principal:
 
-    gerar_layout_comanda(num_cupom, data_hora, lista_produtos, nome_caixa) -> str
+    gerar_layout_comanda(num_cupom, data_hora, lista_produtos, nome_caixa,
+                         numero_caixa, nome_operador) -> str
 
 Para criar um layout alternativo, copie este arquivo com outro nome
 dentro de templates/ e aponte "template" no config_comanda.json para
@@ -48,16 +49,19 @@ def gerar_layout_comanda(
     num_cupom: Any,
     data_hora: str,
     lista_produtos: list[dict[str, Any]],
-    nome_caixa: str,
+    nome_caixa: str = "?",       # mantido por compatibilidade
+    numero_caixa: str = "?",
+    nome_operador: str = "?",
 ) -> str:
     linhas: list[str] = []
 
     linhas.append(_linha_separadora("="))
     linhas.append("COMANDA DE PRODUCAO".center(LARGURA))
     linhas.append(_linha_separadora("="))
-    linhas.append(f"Pedido: {num_cupom}")
-    linhas.append(f"Data/Hora: {data_hora}")
-    linhas.append(f"Caixa/Operador: {nome_caixa}")
+    linhas.append(f"Cupom NFC-e: {num_cupom}")
+    linhas.append(f"Data/Hora : {data_hora}")
+    linhas.append(f"Caixa     : {numero_caixa}")
+    linhas.append(f"Operador  : {nome_operador}")
     linhas.append(_linha_separadora())
 
     for item in lista_produtos:

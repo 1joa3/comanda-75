@@ -237,12 +237,16 @@ def buscar_pedidos_faturados(conn: oracledb.Connection, janela_minutos: int, con
 
     query = f"""
         SELECT
-            C.NUMPEDECF AS NUMPED,
+            C.NUMPEDECF  AS NUMPED,
+            C.NUMCUPOM,
             C.CODFILIAL,
-            C.CODUSUR,
+            C.CODFUNCCX,
+            C.NUMCAIXA,
+            E.NOME        AS NOMEOPERADOR,
             C.DATA,
             C.POSICAO
         FROM {schema}PCPEDCECF C
+        LEFT JOIN {schema}PCEMPR E ON E.MATRICULA = C.CODFUNCCX
         WHERE C.POSICAO = 'L'
           AND C.DATA >= TRUNC(SYSDATE - 1)
         ORDER BY C.DATA, C.NUMPEDECF
@@ -323,21 +327,24 @@ def carregar_template(nome_template: str):
 # ---------------------------------------------------------------------------
 
 def imprimir(texto: str, nome_impressora: str, encoding: str = "cp850") -> None:
-    if not nome_impressora or nome_impressora.lower() == "default":
-        nome_impressora = win32print.GetDefaultPrinter()
+    # 1. Salva o texto em um arquivo .txt fisico
+    nome_arquivo = f"comanda_{int(time.time())}.txt"
+    caminho_txt = PROCESSADOS_DIR / nome_arquivo
+    
+    with open(caminho_txt, "w", encoding=encoding, errors="replace") as f:
+        f.write(texto)
+        
+    logger.info("Comanda salva em: %s", caminho_txt)
 
-    handle = win32print.OpenPrinter(nome_impressora)
-    try:
-        win32print.StartDocPrinter(handle, 1, ("Comanda AutoComanda", None, "RAW"))
-        try:
-            win32print.StartPagePrinter(handle)
-            dados = texto.encode(encoding, errors="replace")
-            win32print.WritePrinter(handle, dados)
-            win32print.EndPagePrinter(handle)
-        finally:
-            win32print.EndDocPrinter(handle)
-    finally:
-        win32print.ClosePrinter(handle)
+    # 2. Envia o .txt para a impressora pelo Windows
+    # Usa o Notepad para imprimir o arquivo texto de forma silenciosa
+    import subprocess
+    if not nome_impressora or nome_impressora.lower() == "default":
+        # Imprime na impressora padrao
+        os.startfile(str(caminho_txt), "print")
+    else:
+        # Imprime em impressora especifica
+        subprocess.run(["notepad.exe", "/pt", str(caminho_txt), nome_impressora], check=True)
 
 
 # ---------------------------------------------------------------------------
@@ -364,11 +371,17 @@ def processar_pedido(
         marcar_processado(historico, num_pedido, qtd_itens=0, impresso=False)
         return
 
+    num_cupom_nfce = str(pedido.get("NUMCUPOM") or num_pedido)
+    cod_operador = pedido.get("CODFUNCCX") or "?"
+    nome_operador = pedido.get("NOMEOPERADOR") or "OPERADOR"
+    
     texto_comanda = template_mod.gerar_layout_comanda(
-        num_cupom=num_pedido,
+        num_cupom=num_cupom_nfce,
         data_hora=datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         lista_produtos=itens_preparo,
-        nome_caixa=str(pedido.get("CODUSUR") or pedido.get("CODFILIAL") or "?"),
+        nome_caixa=str(pedido.get("CODFILIAL") or "?"),
+        numero_caixa=str(pedido.get("NUMCAIXA") or "?"),
+        nome_operador=f"{cod_operador} - {nome_operador}",
     )
 
     try:
@@ -412,7 +425,7 @@ def executar() -> None:
         try:
             if ora_conn is None:
                 ora_conn = conectar_oracle(config)
-                logger.info("Conectado ao banco de dados com sucesso.")
+                logger.info("Conectado com sucesso.")
 
             pedidos = buscar_pedidos_faturados(ora_conn, janela_minutos, config)
             for pedido in pedidos:
