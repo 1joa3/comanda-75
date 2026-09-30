@@ -30,9 +30,11 @@ ATENCAO - dicionario de dados:
 
 from __future__ import annotations
 
+import glob
 import importlib
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sqlite3
 import sys
@@ -83,7 +85,10 @@ def configurar_logging() -> logging.Logger:
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    arquivo = logging.FileHandler(str(LOG_PATH), encoding="utf-8")
+    # Rotacao automatica: max 2 MB por arquivo, mantem ate 3 backups
+    arquivo = RotatingFileHandler(
+        str(LOG_PATH), maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
     arquivo.setFormatter(formato)
     logger.addHandler(arquivo)
 
@@ -151,6 +156,34 @@ def abrir_historico() -> sqlite3.Connection:
     )
     conn.commit()
     return conn
+
+
+def purgar_historico_antigo(historico: sqlite3.Connection, dias: int = 7) -> None:
+    """Remove registros com mais de N dias do historico SQLite."""
+    historico.execute(
+        "DELETE FROM cupons_processados WHERE data_processado < datetime('now', ?)",
+        (f"-{dias} days",),
+    )
+    removidos = historico.execute("SELECT changes()").fetchone()[0]
+    historico.commit()
+    if removidos:
+        logger.info("Historico: %d registro(s) com mais de %d dias removido(s).", removidos, dias)
+
+
+def limpar_comandas_antigas(dias: int = 3) -> None:
+    """Remove arquivos .txt de comandas com mais de N dias da pasta processados/."""
+    import time as _time
+    limite = _time.time() - (dias * 86400)
+    removidos = 0
+    for arquivo in PROCESSADOS_DIR.glob("comanda_*.txt"):
+        try:
+            if arquivo.stat().st_mtime < limite:
+                arquivo.unlink()
+                removidos += 1
+        except OSError:
+            pass
+    if removidos:
+        logger.info("Limpeza: %d arquivo(s) .txt com mais de %d dias removido(s).", removidos, dias)
 
 
 def ja_processado(historico: sqlite3.Connection, num_pedido: Any) -> bool:
@@ -403,11 +436,16 @@ def executar() -> None:
 
     inicio_execucao = datetime.now()
     logger.info("=== AutoComanda iniciado ===")
+    logger.info("Somente cupons a partir de %s serao processados.", inicio_execucao.strftime("%d/%m/%Y %H:%M:%S"))
     logger.debug("Diretorio base: %s", BASE_DIR)
 
     config = carregar_config()
     template_mod = carregar_template(config["template"])
     historico = abrir_historico()
+
+    # Limpeza de dados antigos ao iniciar
+    purgar_historico_antigo(historico, dias=7)
+    limpar_comandas_antigas(dias=3)
 
     intervalo_segundos = int(config.get("intervalo_verificacao_segundos", 5))
     janela_minutos = int(config.get("janela_busca_minutos", 60))
@@ -444,3 +482,10 @@ if __name__ == "__main__":
         executar()
     except KeyboardInterrupt:
         logger.info("AutoComanda encerrado pelo usuario.")
+    except Exception:
+        logger.exception("Erro fatal ao iniciar o AutoComanda.")
+        print("\n" + "=" * 60)
+        print("  ERRO: O AutoComanda nao conseguiu iniciar.")
+        print("  Verifique o arquivo autocomanda.log para detalhes.")
+        print("=" * 60)
+        input("\nPressione ENTER para fechar...")
