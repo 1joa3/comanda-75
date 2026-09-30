@@ -56,7 +56,7 @@ def gerar_layout_comanda(
     linhas: list[str] = []
 
     linhas.append(_linha_separadora("="))
-    linhas.append("COMANDA DE PRODUCAO".center(LARGURA))
+    linhas.append("ORDEM DE PRODUCAO".center(LARGURA))
     linhas.append(_linha_separadora("="))
     linhas.append(f"Cupom NFC-e: {num_cupom}")
     linhas.append(f"Data/Hora : {data_hora}")

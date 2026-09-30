@@ -1,0 +1,17 @@
+{
+    "oracle": {
+        "usuario": "SEU_USUARIO",
+        "senha": "SUA_SENHA",
+        "dsn": "localhost:1521/XE",
+        "instant_client_dir": "instantclient_19_24"
+    },
+    "impressora_destino": "Default",
+    "filtro_por": "id_produto",
+    "itens_preparo": [
+        1100
+    ],
+    "template": "comanda_padrao",
+    "intervalo_verificacao_segundos": 5,
+    "janela_busca_minutos": 60,
+    "encoding_impressora": "cp850"
+}

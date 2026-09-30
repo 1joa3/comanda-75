@@ -218,17 +218,13 @@ def conectar_oracle(config: dict[str, Any]) -> oracledb.Connection:
     )
 
 
-def buscar_pedidos_faturados(conn: oracledb.Connection, janela_minutos: int, config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Busca pedidos com POSICAO = 'F' (faturado) dentro de uma janela de
-    tempo recente. A janela pode (e deve) ser generosa: quem evita
-    reprocessar/reimprimir e o controle via SQLite (historico.db), entao
-    nao ha problema em reconsultar os ultimos N minutos a cada ciclo -
-    inclusive apos o AutoComanda ser reiniciado.
+def buscar_pedidos_faturados(conn: oracledb.Connection, janela_minutos: int, config: dict[str, Any], inicio_execucao: datetime | None = None) -> list[dict[str, Any]]:
+    """Busca pedidos com POSICAO = 'L' (liberado) a partir do momento em
+    que o AutoComanda foi iniciado.
 
-    NOTA: se a coluna DATA da sua base nao carregar a hora (apenas a
-    data), o filtro por janela em minutos pode nao se comportar como
-    esperado dentro do mesmo dia. Nesse caso, combine com um campo de
-    hora separado, se existir na sua versao.
+    O parametro inicio_execucao define o timestamp de referencia: apenas
+    pedidos com DATA >= inicio_execucao serao retornados. Isso garante
+    que cupons anteriores ao inicio do programa sejam ignorados.
     """
     # Busca o prefixo de schema configurado (ex: "WINTHOR." ou "PCO.")
     schema = config.get("schema_oracle", "")
@@ -248,11 +244,11 @@ def buscar_pedidos_faturados(conn: oracledb.Connection, janela_minutos: int, con
         FROM {schema}PCPEDCECF C
         LEFT JOIN {schema}PCEMPR E ON E.MATRICULA = C.CODFUNCCX
         WHERE C.POSICAO = 'L'
-          AND C.DATA >= TRUNC(SYSDATE - 1)
+          AND C.DATA >= :data_inicio
         ORDER BY C.DATA, C.NUMPEDECF
     """
     with conn.cursor() as cur:
-        cur.execute(query)
+        cur.execute(query, data_inicio=inicio_execucao or datetime.now())
         colunas = [c[0] for c in cur.description]
         return [dict(zip(colunas, linha)) for linha in cur.fetchall()]
 
@@ -367,7 +363,6 @@ def processar_pedido(
     itens_preparo = filtrar_itens_preparo(itens, config)
 
     if not itens_preparo:
-        # Nada de preparo na hora nesta venda: ignora e segue a vida.
         marcar_processado(historico, num_pedido, qtd_itens=0, impresso=False)
         return
 
@@ -398,17 +393,15 @@ def processar_pedido(
     logger.info("Comanda impressa: pedido %s, %d item(ns) de preparo", num_pedido, len(itens_preparo))
     marcar_processado(historico, num_pedido, qtd_itens=len(itens_preparo), impresso=True)
 
-
-# ---------------------------------------------------------------------------
-# Loop principal
-# ---------------------------------------------------------------------------
+# Loop principa
 
 def executar() -> None:
     print("=" * 60)
     print("                 AutoComanda PDV")
     print("=" * 60)
-    print("Monitorando novas comandas... Pressione Ctrl+C para sair.\n")
+    print("Monitorando novos Pedidos... Pressione Ctrl+C para sair.\n")
 
+    inicio_execucao = datetime.now()
     logger.info("=== AutoComanda iniciado ===")
     logger.debug("Diretorio base: %s", BASE_DIR)
 
@@ -427,12 +420,12 @@ def executar() -> None:
                 ora_conn = conectar_oracle(config)
                 logger.info("Conectado com sucesso.")
 
-            pedidos = buscar_pedidos_faturados(ora_conn, janela_minutos, config)
+            pedidos = buscar_pedidos_faturados(ora_conn, janela_minutos, config, inicio_execucao)
             for pedido in pedidos:
                 processar_pedido(ora_conn, historico, config, template_mod, pedido)
 
         except oracledb.DatabaseError:
-            logger.exception("Erro de conexao/consulta no Oracle. Reconectando no proximo ciclo.")
+            logger.exception("Erro de conexao/consulta. Reconectando no proximo ciclo.")
             try:
                 if ora_conn is not None:
                     ora_conn.close()

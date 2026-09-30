@@ -1,7 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [
+    ('config', 'config'),
+    ('templates', 'templates'),
+    ('instantclient_19_24', 'instantclient_19_24'),
+]
 binaries = []
 hiddenimports = ['typing_extensions']
 tmp_ret = collect_all('oracledb')

@@ -1,0 +1,25 @@
+# Build artifacts
+autocomanda/build/
+autocomanda/dist/
+
+# Oracle Instant Client (binarios grandes, nao devem subir no repositorio)
+autocomanda/instantclient_19_24/
+
+# Config com credenciais (cada PDV tem o seu)
+autocomanda/config/config_comanda.json
+
+# Historico local (SQLite)
+autocomanda/processados/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
