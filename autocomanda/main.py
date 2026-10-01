@@ -10,41 +10,41 @@ fluxo de trabalho da cozinha com itens que nao precisam de preparo.
 
 Fluxo:
     1. Le config/config_comanda.json
-    2. Conecta no Oracle (oracledb, modo "thin" por padrao)
-    3. A cada X segundos, busca pedidos faturados numa janela de tempo
+    2. Conecta no Oracle (oracledb em modo "thick", via Oracle Instant
+       Client, para suportar o Oracle XE 10g do caixa)
+    3. A cada X segundos, busca os pedidos liberados do dia (PCPEDCECF)
     4. Para cada pedido ainda nao processado (controle via SQLite local):
-        - busca os itens do pedido
+        - busca os itens do pedido (PCPEDIECF)
         - filtra pelos itens/secao/departamento definidos no JSON
         - se houver item de preparo, gera o layout via template dinamico
           e envia para a impressora configurada
         - marca o pedido como processado no SQLite (evita reimpressao)
 
 ATENCAO - dicionario de dados:
-    Os nomes de tabela/coluna usados nas consultas Oracle (PCPEDC,
-    PCPEDI, PCPRODUT, POSICAO, NUMPED...) seguem o dicionario de dados
-    publico do Winthor e o uso documentado dessas tabelas na rotina
-    2075, mas podem variar conforme a versao/customizacao da base.
-    Valide com `DESCRIBE <tabela>` antes de colocar em producao.
-    Veja tambem sql_exemplo_winthor.sql.
+    Os nomes de tabela/coluna usados nas consultas Oracle (PCPEDCECF,
+    PCPEDIECF, PCPRODUT, PCEMPR, POSICAO, NUMPEDECF...) seguem o
+    dicionario de dados do Winthor, mas podem variar conforme a
+    versao/customizacao da base. Valide com `DESCRIBE <tabela>` antes de
+    colocar em producao. Veja tambem sql_exemplo_winthor.sql.
 """
 
 from __future__ import annotations
 
-import glob
 import importlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
 import sqlite3
+import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Optional
 
 import oracledb
-import win32print
 
 
 # ---------------------------------------------------------------------------
@@ -72,22 +72,39 @@ PROCESSADOS_DIR = BASE_DIR / "processados"
 HISTORICO_DB_PATH = PROCESSADOS_DIR / "historico.db"
 LOG_PATH = BASE_DIR / "autocomanda.log"
 
+# Rotacao do log: max 2 MB por arquivo, mantem ate 3 backups
+LOG_TAMANHO_MAX_BYTES = 2 * 1024 * 1024
+LOG_QTD_BACKUPS = 3
+
+# Quantas vezes um pedido pode falhar (erro de dados/template) antes de
+# ser descartado, para nao travar a fila dos pedidos seguintes.
+MAX_TENTATIVAS_PEDIDO = 3
+
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
-def configurar_logging() -> logging.Logger:
-    logger = logging.getLogger("autocomanda")
+logger = logging.getLogger("autocomanda")
+
+
+def configurar_logging() -> None:
+    """Configura arquivo + console. Idempotente: chamar de novo nao
+    duplica os handlers."""
+    if logger.handlers:
+        return
+
     logger.setLevel(logging.INFO)
 
     formato = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    # Rotacao automatica: max 2 MB por arquivo, mantem ate 3 backups
     arquivo = RotatingFileHandler(
-        str(LOG_PATH), maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        str(LOG_PATH),
+        maxBytes=LOG_TAMANHO_MAX_BYTES,
+        backupCount=LOG_QTD_BACKUPS,
+        encoding="utf-8",
     )
     arquivo.setFormatter(formato)
     logger.addHandler(arquivo)
@@ -96,10 +113,53 @@ def configurar_logging() -> logging.Logger:
     console.setFormatter(formato)
     logger.addHandler(console)
 
-    return logger
+
+# ---------------------------------------------------------------------------
+# Instancia unica (evita duas copias imprimindo cada comanda em dobro)
+# ---------------------------------------------------------------------------
+
+NOME_MUTEX = "AutoComanda_InstanciaUnica"
+
+# Referencia mantida enquanto o processo vive; o sistema libera a trava
+# sozinho quando o processo termina (inclusive se travar ou for morto).
+_trava_instancia: Any = None
 
 
-logger = configurar_logging()
+def garantir_instancia_unica() -> bool:
+    """Retorna False se ja houver outro AutoComanda rodando na maquina."""
+    global _trava_instancia
+
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        ERROR_ALREADY_EXISTS = 183
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+
+        # "Global\" vale para todas as sessoes de usuario da maquina;
+        # se o Windows recusar, cai para a sessao atual ("Local\").
+        for prefixo in ("Global\\", "Local\\"):
+            handle = kernel32.CreateMutexW(None, False, prefixo + NOME_MUTEX)
+            erro = ctypes.get_last_error()
+            if handle:
+                _trava_instancia = handle
+                return erro != ERROR_ALREADY_EXISTS
+        # Nao conseguiu criar o mutex: nao impede a execucao.
+        logger.warning("Nao foi possivel verificar instancia unica (erro %d).", erro)
+        return True
+
+    # Fora do Windows (desenvolvimento/testes): trava por arquivo.
+    import fcntl
+
+    PROCESSADOS_DIR.mkdir(parents=True, exist_ok=True)
+    _trava_instancia = open(PROCESSADOS_DIR / "autocomanda.lock", "w")
+    try:
+        fcntl.flock(_trava_instancia, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +170,14 @@ CAMPO_POR_FILTRO = {
     "id_produto": "CODPROD",
     "secao": "CODSECAO",
     "departamento": "CODEPTO",
+}
+
+PADROES_CONFIG = {
+    "intervalo_verificacao_segundos": 5,
+    "encoding_impressora": "cp850",
+    "schema_oracle": "",
+    "dias_historico": 7,
+    "dias_comandas_txt": 3,
 }
 
 
@@ -131,8 +199,16 @@ def carregar_config() -> dict[str, Any]:
             f"Use um de: {list(CAMPO_POR_FILTRO)}"
         )
 
+    for chave, padrao in PADROES_CONFIG.items():
+        config.setdefault(chave, padrao)
+
     # normaliza para lookup rapido (set de inteiros)
     config["itens_preparo"] = {int(x) for x in config["itens_preparo"]}
+
+    # prefixo de schema pronto para uso nas consultas (ex: "WINTHOR.")
+    schema = config["schema_oracle"]
+    if schema and not schema.endswith("."):
+        config["schema_oracle"] = schema + "."
 
     return config
 
@@ -158,22 +234,23 @@ def abrir_historico() -> sqlite3.Connection:
     return conn
 
 
-def purgar_historico_antigo(historico: sqlite3.Connection, dias: int = 7) -> None:
-    """Remove registros com mais de N dias do historico SQLite."""
-    historico.execute(
-        "DELETE FROM cupons_processados WHERE data_processado < datetime('now', ?)",
-        (f"-{dias} days",),
+def purgar_historico_antigo(historico: sqlite3.Connection, dias: int) -> None:
+    """Remove registros com mais de N dias do historico SQLite.
+
+    O limite e calculado em hora local, no mesmo formato ISO usado em
+    marcar_processado (o datetime('now') do SQLite seria UTC)."""
+    limite = (datetime.now() - timedelta(days=dias)).isoformat(timespec="seconds")
+    cur = historico.execute(
+        "DELETE FROM cupons_processados WHERE data_processado < ?", (limite,)
     )
-    removidos = historico.execute("SELECT changes()").fetchone()[0]
     historico.commit()
-    if removidos:
-        logger.info("Historico: %d registro(s) com mais de %d dias removido(s).", removidos, dias)
+    if cur.rowcount:
+        logger.info("Historico: %d registro(s) com mais de %d dias removido(s).", cur.rowcount, dias)
 
 
-def limpar_comandas_antigas(dias: int = 3) -> None:
+def limpar_comandas_antigas(dias: int) -> None:
     """Remove arquivos .txt de comandas com mais de N dias da pasta processados/."""
-    import time as _time
-    limite = _time.time() - (dias * 86400)
+    limite = time.time() - (dias * 86400)
     removidos = 0
     for arquivo in PROCESSADOS_DIR.glob("comanda_*.txt"):
         try:
@@ -189,6 +266,16 @@ def limpar_comandas_antigas(dias: int = 3) -> None:
 def ja_processado(historico: sqlite3.Connection, num_pedido: Any) -> bool:
     cur = historico.execute(
         "SELECT 1 FROM cupons_processados WHERE num_pedido = ?", (str(num_pedido),)
+    )
+    return cur.fetchone() is not None
+
+
+def tem_registro_hoje(historico: sqlite3.Connection) -> bool:
+    """Indica se o historico ja tem algum pedido registrado hoje, ou seja,
+    se o AutoComanda ja rodou hoje (data_processado e ISO local)."""
+    hoje = datetime.now().date().isoformat()
+    cur = historico.execute(
+        "SELECT 1 FROM cupons_processados WHERE data_processado >= ? LIMIT 1", (hoje,)
     )
     return cur.fetchone() is not None
 
@@ -251,7 +338,9 @@ def conectar_oracle(config: dict[str, Any]) -> oracledb.Connection:
     )
 
 
-def buscar_pedidos_faturados(conn: oracledb.Connection, janela_minutos: int, config: dict[str, Any], inicio_execucao: datetime | None = None) -> list[dict[str, Any]]:
+def buscar_pedidos_faturados(
+    conn: oracledb.Connection, config: dict[str, Any], inicio_execucao: datetime
+) -> list[dict[str, Any]]:
     """Busca pedidos com POSICAO = 'L' (liberado) a partir do dia em que
     o AutoComanda foi iniciado.
 
@@ -259,10 +348,7 @@ def buscar_pedidos_faturados(conn: oracledb.Connection, janela_minutos: int, con
     armazenam apenas a data (sem hora). O controle fino de reimpressao
     fica a cargo do SQLite local (historico.db).
     """
-    # Busca o prefixo de schema configurado (ex: "WINTHOR." ou "PCO.")
-    schema = config.get("schema_oracle", "")
-    if schema and not schema.endswith("."):
-        schema += "."
+    schema = config["schema_oracle"]
 
     query = f"""
         SELECT
@@ -281,7 +367,7 @@ def buscar_pedidos_faturados(conn: oracledb.Connection, janela_minutos: int, con
         ORDER BY C.DATA, C.NUMPEDECF
     """
     with conn.cursor() as cur:
-        cur.execute(query, data_inicio=inicio_execucao or datetime.now())
+        cur.execute(query, data_inicio=inicio_execucao)
         colunas = [c[0] for c in cur.description]
         return [dict(zip(colunas, linha)) for linha in cur.fetchall()]
 
@@ -289,17 +375,22 @@ def buscar_pedidos_faturados(conn: oracledb.Connection, janela_minutos: int, con
 def buscar_itens_pedido(conn: oracledb.Connection, num_pedido: Any, config: dict[str, Any]) -> list[dict[str, Any]]:
     """Busca os itens de um pedido, com departamento/secao do produto
     (necessarios para os modos de filtro 'departamento' e 'secao')."""
-    schema = config.get("schema_oracle", "")
-    if schema and not schema.endswith("."):
-        schema += "."
+    schema = config["schema_oracle"]
+
+    # Departamento/secao so sao lidos quando o filtro precisa deles, para
+    # que o modo "id_produto" nao dependa dessas colunas. No Winthor a
+    # secao do produto fica em PCPRODUT.CODSEC (nao CODSECAO).
+    filtro = config["filtro_por"]
+    col_depto = "P.CODEPTO" if filtro == "departamento" else "NULL"
+    col_secao = "P.CODSEC" if filtro == "secao" else "NULL"
 
     query = f"""
         SELECT
             I.CODPROD,
             P.DESCRICAO,
             I.QT,
-            NULL AS CODEPTO,
-            NULL AS CODSECAO
+            {col_depto} AS CODEPTO,
+            {col_secao} AS CODSECAO
         FROM {schema}PCPEDIECF I
         JOIN {schema}PCPRODUT P ON P.CODPROD = I.CODPROD
         WHERE I.NUMPEDECF = :num_pedido
@@ -337,7 +428,7 @@ def filtrar_itens_preparo(itens: list[dict[str, Any]], config: dict[str, Any]) -
 # Template (import dinamico de templates/<nome>.py)
 # ---------------------------------------------------------------------------
 
-def carregar_template(nome_template: str):
+def carregar_template(nome_template: str) -> ModuleType:
     if str(TEMPLATES_DIR) not in sys.path:
         sys.path.insert(0, str(TEMPLATES_DIR))
 
@@ -346,28 +437,31 @@ def carregar_template(nome_template: str):
     if not hasattr(modulo, "gerar_layout_comanda"):
         raise AttributeError(
             f"O template '{nome_template}' precisa definir a funcao "
-            "gerar_layout_comanda(num_cupom, data_hora, lista_produtos, nome_caixa)"
+            "gerar_layout_comanda(num_cupom, data_hora, lista_produtos, "
+            "nome_caixa, numero_caixa, nome_operador)"
         )
     return modulo
 
 
 # ---------------------------------------------------------------------------
-# Impressao (win32print, envio RAW para impressora termica)
+# Impressao (arquivo .txt enviado a impressora pelo Windows)
 # ---------------------------------------------------------------------------
 
-def imprimir(texto: str, nome_impressora: str, encoding: str = "cp850") -> None:
-    # 1. Salva o texto em um arquivo .txt fisico
-    nome_arquivo = f"comanda_{int(time.time())}.txt"
-    caminho_txt = PROCESSADOS_DIR / nome_arquivo
-    
+def salvar_comanda(texto: str, num_pedido: Any, encoding: str) -> Path:
+    """Grava a comanda em processados/. O nome inclui o numero do pedido,
+    para que dois pedidos no mesmo segundo nao sobrescrevam um ao outro."""
+    carimbo = datetime.now().strftime("%Y%m%d_%H%M%S")
+    caminho_txt = PROCESSADOS_DIR / f"comanda_{num_pedido}_{carimbo}.txt"
+
     with open(caminho_txt, "w", encoding=encoding, errors="replace") as f:
         f.write(texto)
-        
-    logger.info("Comanda salva em: %s", caminho_txt)
 
-    # 2. Envia o .txt para a impressora pelo Windows
-    # Usa o Notepad para imprimir o arquivo texto de forma silenciosa
-    import subprocess
+    logger.info("Comanda salva em: %s", caminho_txt)
+    return caminho_txt
+
+
+def enviar_para_impressora(caminho_txt: Path, nome_impressora: str) -> None:
+    """Imprime o .txt de forma silenciosa pelo Windows."""
     if not nome_impressora or nome_impressora.lower() == "default":
         # Imprime na impressora padrao
         os.startfile(str(caminho_txt), "print")
@@ -380,11 +474,22 @@ def imprimir(texto: str, nome_impressora: str, encoding: str = "cp850") -> None:
 # Processamento de um pedido
 # ---------------------------------------------------------------------------
 
+def horario_venda(pedido: dict[str, Any]) -> datetime:
+    """Horario da venda para exibir na comanda.
+
+    Usa C.DATA quando ela traz hora; se vier so a data (meia-noite), cai
+    para o horario atual, que e o mais proximo disponivel."""
+    data = pedido.get("DATA")
+    if isinstance(data, datetime) and data.time() != datetime.min.time():
+        return data
+    return datetime.now()
+
+
 def processar_pedido(
     ora_conn: oracledb.Connection,
     historico: sqlite3.Connection,
     config: dict[str, Any],
-    template_mod,
+    template_mod: ModuleType,
     pedido: dict[str, Any],
 ) -> None:
     num_pedido = pedido["NUMPED"]
@@ -402,10 +507,10 @@ def processar_pedido(
     num_cupom_nfce = str(pedido.get("NUMCUPOM") or num_pedido)
     cod_operador = pedido.get("CODFUNCCX") or "?"
     nome_operador = pedido.get("NOMEOPERADOR") or "OPERADOR"
-    
+
     texto_comanda = template_mod.gerar_layout_comanda(
         num_cupom=num_cupom_nfce,
-        data_hora=datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        data_hora=horario_venda(pedido).strftime("%d/%m/%Y %H:%M:%S"),
         lista_produtos=itens_preparo,
         nome_caixa=str(pedido.get("CODFILIAL") or "?"),
         numero_caixa=str(pedido.get("NUMCAIXA") or "?"),
@@ -413,20 +518,57 @@ def processar_pedido(
     )
 
     try:
-        imprimir(
-            texto_comanda,
-            config["impressora_destino"],
-            encoding=config.get("encoding_impressora", "cp850"),
-        )
+        caminho_txt = salvar_comanda(texto_comanda, num_pedido, config["encoding_impressora"])
+        enviar_para_impressora(caminho_txt, config["impressora_destino"])
     except Exception:
         logger.exception("Falha ao imprimir comanda do pedido %s", num_pedido)
-        # Nao marca como processado: tenta novamente no proximo ciclo.
+        # Nao marca como processado: tenta novamente no proximo ciclo
+        # (impressora desligada/sem papel nao deve perder o pedido).
         return
 
     logger.info("Comanda impressa: pedido %s, %d item(ns) de preparo", num_pedido, len(itens_preparo))
     marcar_processado(historico, num_pedido, qtd_itens=len(itens_preparo), impresso=True)
 
-# Loop principa
+
+def processar_pedidos(
+    ora_conn: oracledb.Connection,
+    historico: sqlite3.Connection,
+    config: dict[str, Any],
+    template_mod: ModuleType,
+    pedidos: list[dict[str, Any]],
+    falhas: dict[str, int],
+) -> None:
+    """Processa cada pedido isoladamente: um pedido com erro nao impede
+    os seguintes. Depois de MAX_TENTATIVAS_PEDIDO falhas o pedido e
+    registrado como nao impresso e sai da fila.
+
+    Erros do Oracle sobem para o loop principal, que reconecta."""
+    for pedido in pedidos:
+        num_pedido = str(pedido["NUMPED"])
+        try:
+            processar_pedido(ora_conn, historico, config, template_mod, pedido)
+        except oracledb.DatabaseError:
+            raise
+        except Exception:
+            falhas[num_pedido] = falhas.get(num_pedido, 0) + 1
+            tentativa = falhas[num_pedido]
+            if tentativa < MAX_TENTATIVAS_PEDIDO:
+                logger.exception(
+                    "Erro ao processar pedido %s (tentativa %d de %d).",
+                    num_pedido, tentativa, MAX_TENTATIVAS_PEDIDO,
+                )
+                continue
+            logger.exception(
+                "Pedido %s falhou %d vezes e foi DESCARTADO, sem imprimir. "
+                "Verifique o pedido manualmente.", num_pedido, tentativa,
+            )
+            marcar_processado(historico, num_pedido, qtd_itens=0, impresso=False)
+            del falhas[num_pedido]
+
+
+# ---------------------------------------------------------------------------
+# Loop principal
+# ---------------------------------------------------------------------------
 
 def executar() -> None:
     print("=" * 60)
@@ -436,7 +578,6 @@ def executar() -> None:
 
     inicio_execucao = datetime.now()
     logger.info("=== AutoComanda iniciado ===")
-    logger.info("Somente cupons a partir de %s serao processados.", inicio_execucao.strftime("%d/%m/%Y %H:%M:%S"))
     logger.debug("Diretorio base: %s", BASE_DIR)
 
     config = carregar_config()
@@ -444,13 +585,22 @@ def executar() -> None:
     historico = abrir_historico()
 
     # Limpeza de dados antigos ao iniciar
-    purgar_historico_antigo(historico, dias=7)
-    limpar_comandas_antigas(dias=3)
+    purgar_historico_antigo(historico, dias=int(config["dias_historico"]))
+    limpar_comandas_antigas(dias=int(config["dias_comandas_txt"]))
 
-    intervalo_segundos = int(config.get("intervalo_verificacao_segundos", 5))
-    janela_minutos = int(config.get("janela_busca_minutos", 60))
+    intervalo_segundos = int(config["intervalo_verificacao_segundos"])
 
     ora_conn: Optional[oracledb.Connection] = None
+    falhas: dict[str, int] = {}
+
+    # A consulta busca desde o inicio do dia (a coluna DATA nao tem hora).
+    # Se o AutoComanda ainda nao rodou hoje (instalacao nova ou PDV ligado
+    # no meio do expediente), os pedidos ja existentes sao apenas
+    # registrados, sem imprimir, para nao mandar uma rajada de comandas
+    # antigas para a cozinha. Num reinicio no meio do dia o historico ja
+    # tem registros de hoje, entao pedidos feitos durante a parada ainda
+    # sao impressos.
+    ignorar_pendentes = not tem_registro_hoje(historico)
 
     while True:
         try:
@@ -458,9 +608,21 @@ def executar() -> None:
                 ora_conn = conectar_oracle(config)
                 logger.info("Conectado com sucesso.")
 
-            pedidos = buscar_pedidos_faturados(ora_conn, janela_minutos, config, inicio_execucao)
-            for pedido in pedidos:
-                processar_pedido(ora_conn, historico, config, template_mod, pedido)
+            pedidos = buscar_pedidos_faturados(ora_conn, config, inicio_execucao)
+
+            if ignorar_pendentes:
+                ignorados = 0
+                for pedido in pedidos:
+                    if not ja_processado(historico, pedido["NUMPED"]):
+                        marcar_processado(historico, pedido["NUMPED"], qtd_itens=0, impresso=False)
+                        ignorados += 1
+                ignorar_pendentes = False
+                logger.info(
+                    "Primeira execucao do dia: %d pedido(s) anteriores ao inicio "
+                    "registrados sem imprimir.", ignorados,
+                )
+            else:
+                processar_pedidos(ora_conn, historico, config, template_mod, pedidos, falhas)
 
         except oracledb.DatabaseError:
             logger.exception("Erro de conexao/consulta. Reconectando no proximo ciclo.")
@@ -478,6 +640,17 @@ def executar() -> None:
 
 
 if __name__ == "__main__":
+    configurar_logging()
+
+    if not garantir_instancia_unica():
+        logger.warning("Outra copia do AutoComanda ja esta em execucao. Encerrando esta.")
+        print("\n" + "=" * 60)
+        print("  O AutoComanda ja esta aberto neste computador.")
+        print("  Esta janela sera fechada automaticamente.")
+        print("=" * 60)
+        time.sleep(5)
+        sys.exit(0)
+
     try:
         executar()
     except KeyboardInterrupt:

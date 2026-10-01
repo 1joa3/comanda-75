@@ -21,7 +21,7 @@ SELECT
     P.DESCRICAO,
     I.QT,
     P.CODEPTO,      -- departamento (para filtro_por = "departamento")
-    P.CODSECAO      -- secao        (para filtro_por = "secao")
+    P.CODSEC        -- secao        (para filtro_por = "secao")
 FROM PCPEDI I
 JOIN PCPRODUT P ON P.CODPROD = I.CODPROD
 WHERE I.NUMPED = :num_pedido;

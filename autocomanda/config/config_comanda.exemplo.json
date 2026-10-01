@@ -12,6 +12,7 @@
     ],
     "template": "comanda_padrao",
     "intervalo_verificacao_segundos": 5,
-    "janela_busca_minutos": 60,
-    "encoding_impressora": "cp850"
+    "encoding_impressora": "cp850",
+    "dias_historico": 7,
+    "dias_comandas_txt": 3
 }
