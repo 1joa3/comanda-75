@@ -252,12 +252,12 @@ def conectar_oracle(config: dict[str, Any]) -> oracledb.Connection:
 
 
 def buscar_pedidos_faturados(conn: oracledb.Connection, janela_minutos: int, config: dict[str, Any], inicio_execucao: datetime | None = None) -> list[dict[str, Any]]:
-    """Busca pedidos com POSICAO = 'L' (liberado) a partir do momento em
-    que o AutoComanda foi iniciado.
+    """Busca pedidos com POSICAO = 'L' (liberado) a partir do dia em que
+    o AutoComanda foi iniciado.
 
-    O parametro inicio_execucao define o timestamp de referencia: apenas
-    pedidos com DATA >= inicio_execucao serao retornados. Isso garante
-    que cupons anteriores ao inicio do programa sejam ignorados.
+    Usa TRUNC(:data_inicio) para compatibilidade com colunas DATA que
+    armazenam apenas a data (sem hora). O controle fino de reimpressao
+    fica a cargo do SQLite local (historico.db).
     """
     # Busca o prefixo de schema configurado (ex: "WINTHOR." ou "PCO.")
     schema = config.get("schema_oracle", "")
@@ -277,7 +277,7 @@ def buscar_pedidos_faturados(conn: oracledb.Connection, janela_minutos: int, con
         FROM {schema}PCPEDCECF C
         LEFT JOIN {schema}PCEMPR E ON E.MATRICULA = C.CODFUNCCX
         WHERE C.POSICAO = 'L'
-          AND C.DATA >= :data_inicio
+          AND C.DATA >= TRUNC(:data_inicio)
         ORDER BY C.DATA, C.NUMPEDECF
     """
     with conn.cursor() as cur:

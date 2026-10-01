@@ -5,6 +5,8 @@ datas = [
     ('config', 'config'),
     ('templates', 'templates'),
     ('instantclient_19_24', 'instantclient_19_24'),
+    ('instalar_autostart.bat', '.'),
+    ('desinstalar_autostart.bat', '.'),
 ]
 binaries = []
 hiddenimports = ['typing_extensions']
