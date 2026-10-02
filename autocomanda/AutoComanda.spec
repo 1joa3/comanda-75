@@ -1,13 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [
-    ('config', 'config'),
-    ('templates', 'templates'),
-    ('instantclient_19_24', 'instantclient_19_24'),
-    ('instalar_autostart.bat', '.'),
-    ('desinstalar_autostart.bat', '.'),
-]
+datas = []
 binaries = []
 hiddenimports = ['typing_extensions']
 tmp_ret = collect_all('oracledb')
@@ -55,3 +49,17 @@ coll = COLLECT(
     upx_exclude=[],
     name='AutoComanda',
 )
+
+import shutil
+import os
+
+dist_dir = os.path.join(DISTPATH, 'AutoComanda')
+
+# Copia as pastas para a raiz do dist (ao lado do .exe e fora do _internal)
+shutil.copytree('config', os.path.join(dist_dir, 'config'), dirs_exist_ok=True)
+shutil.copytree('templates', os.path.join(dist_dir, 'templates'), dirs_exist_ok=True)
+shutil.copytree('instantclient_19_24', os.path.join(dist_dir, 'instantclient_19_24'), dirs_exist_ok=True)
+
+# Copia os scripts .bat
+shutil.copy('instalar_autostart.bat', dist_dir)
+shutil.copy('desinstalar_autostart.bat', dist_dir)
