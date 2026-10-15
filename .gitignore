@@ -23,3 +23,6 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# Arquivos compactados (backups/exportacoes podem conter credenciais)
+*.zip
