@@ -461,13 +461,113 @@ def salvar_comanda(texto: str, num_pedido: Any, encoding: str) -> Path:
 
 
 def enviar_para_impressora(caminho_txt: Path, nome_impressora: str) -> None:
-    """Imprime o .txt de forma silenciosa pelo Windows."""
+    """Imprime o .txt de forma RAW (direto no spooler) no Windows para evitar
+    margens e quebra de linhas indesejadas do Notepad em impressoras termicas."""
+    
+    if sys.platform != "win32":
+        logger.warning("Impressao RAW suportada apenas no Windows. Usando fallback.")
+        if not nome_impressora or nome_impressora.lower() == "default":
+            pass
+        else:
+            subprocess.run(["lp", "-d", nome_impressora, str(caminho_txt)], check=False)
+        return
+
+    import ctypes
+    from ctypes import wintypes
+    
+    with open(caminho_txt, 'rb') as f:
+        raw_data = f.read()
+        
+    # Garante newlines no final para avanco do papel e chegar na guilhotina
+    if not raw_data.endswith(b'\n'):
+        raw_data += b'\n'
+    raw_data += b'\n\n\n\n\n'
+
+    # Comando ESC/POS para acionar a guilhotina (Corte parcial / total)
+    # GS V 1 (0x1D 0x56 0x01) ou ESC m (0x1B 0x6D)
+    raw_data += b'\x1d\x56\x01\x1b\x6d'
+
+    winspool = ctypes.WinDLL('winspool.drv')
+
+    class DOC_INFO_1(ctypes.Structure):
+        _fields_ = [("pDocName", ctypes.c_wchar_p),
+                    ("pOutputFile", ctypes.c_wchar_p),
+                    ("pDatatype", ctypes.c_wchar_p)]
+
+    OpenPrinter = winspool.OpenPrinterW
+    OpenPrinter.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p]
+    OpenPrinter.restype = wintypes.BOOL
+    
+    ClosePrinter = winspool.ClosePrinter
+    ClosePrinter.argtypes = [wintypes.HANDLE]
+    ClosePrinter.restype = wintypes.BOOL
+
+    StartDocPrinter = winspool.StartDocPrinterW
+    StartDocPrinter.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(DOC_INFO_1)]
+    StartDocPrinter.restype = wintypes.DWORD
+
+    EndDocPrinter = winspool.EndDocPrinter
+    EndDocPrinter.argtypes = [wintypes.HANDLE]
+    EndDocPrinter.restype = wintypes.BOOL
+
+    StartPagePrinter = winspool.StartPagePrinter
+    StartPagePrinter.argtypes = [wintypes.HANDLE]
+    StartPagePrinter.restype = wintypes.BOOL
+
+    EndPagePrinter = winspool.EndPagePrinter
+    EndPagePrinter.argtypes = [wintypes.HANDLE]
+    EndPagePrinter.restype = wintypes.BOOL
+
+    WritePrinter = winspool.WritePrinter
+    WritePrinter.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    WritePrinter.restype = wintypes.BOOL
+
+    GetDefaultPrinter = winspool.GetDefaultPrinterW
+    GetDefaultPrinter.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(wintypes.DWORD)]
+    GetDefaultPrinter.restype = wintypes.BOOL
+
     if not nome_impressora or nome_impressora.lower() == "default":
-        # Imprime na impressora padrao
-        os.startfile(str(caminho_txt), "print")
-    else:
-        # Imprime em impressora especifica
-        subprocess.run(["notepad.exe", "/pt", str(caminho_txt), nome_impressora], check=True)
+        size = wintypes.DWORD(0)
+        GetDefaultPrinter(None, ctypes.byref(size))
+        if size.value > 0:
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if GetDefaultPrinter(buffer, ctypes.byref(size)):
+                nome_impressora = buffer.value
+            else:
+                logger.error("Falha ao obter impressora padrao.")
+                return
+        else:
+            logger.error("Nenhuma impressora padrao configurada.")
+            return
+
+    hPrinter = wintypes.HANDLE()
+    if not OpenPrinter(nome_impressora, ctypes.byref(hPrinter), None):
+        logger.error("Falha ao abrir impressora '%s'. Erro: %s", nome_impressora, ctypes.GetLastError())
+        return
+        
+    try:
+        doc_info = DOC_INFO_1(pDocName="AutoComanda", pOutputFile=None, pDatatype="RAW")
+        
+        job_id = StartDocPrinter(hPrinter, 1, ctypes.byref(doc_info))
+        if not job_id:
+            logger.error("Falha em StartDocPrinter. Erro: %s", ctypes.GetLastError())
+            return
+            
+        try:
+            if not StartPagePrinter(hPrinter):
+                logger.error("Falha em StartPagePrinter. Erro: %s", ctypes.GetLastError())
+                return
+                
+            try:
+                written = wintypes.DWORD(0)
+                if not WritePrinter(hPrinter, raw_data, len(raw_data), ctypes.byref(written)):
+                    logger.error("Falha em WritePrinter. Erro: %s", ctypes.GetLastError())
+            finally:
+                EndPagePrinter(hPrinter)
+        finally:
+            EndDocPrinter(hPrinter)
+    finally:
+        ClosePrinter(hPrinter)
 
 
 # ---------------------------------------------------------------------------
