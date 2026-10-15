@@ -80,6 +80,10 @@ LOG_QTD_BACKUPS = 3
 # ser descartado, para nao travar a fila dos pedidos seguintes.
 MAX_TENTATIVAS_PEDIDO = 3
 
+# Quantos ciclos esperar por itens de um pedido que chegou sem nenhum item
+# (cabecalho gravado antes dos itens) antes de dar o pedido por encerrado.
+MAX_CICLOS_SEM_ITENS = 6
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -338,15 +342,14 @@ def conectar_oracle(config: dict[str, Any]) -> oracledb.Connection:
     )
 
 
-def buscar_pedidos_faturados(
-    conn: oracledb.Connection, config: dict[str, Any], inicio_execucao: datetime
-) -> list[dict[str, Any]]:
-    """Busca pedidos com POSICAO = 'L' (liberado) a partir do dia em que
-    o AutoComanda foi iniciado.
+def buscar_pedidos_faturados(conn: oracledb.Connection, config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Busca pedidos com POSICAO = 'L' (liberado) do dia atual.
 
-    Usa TRUNC(:data_inicio) para compatibilidade com colunas DATA que
-    armazenam apenas a data (sem hora). O controle fino de reimpressao
-    fica a cargo do SQLite local (historico.db).
+    Usa TRUNC para compatibilidade com colunas DATA que armazenam apenas a
+    data (sem hora). Ate 1 hora apos a meia-noite a janela ainda inclui o
+    dia anterior, para nao perder pedidos fechados na virada do dia; e ela
+    nao cresce mesmo que o PDV fique varios dias sem reiniciar. O controle fino de
+    reimpressao fica a cargo do SQLite local (historico.db).
     """
     schema = config["schema_oracle"]
 
@@ -363,11 +366,11 @@ def buscar_pedidos_faturados(
         FROM {schema}PCPEDCECF C
         LEFT JOIN {schema}PCEMPR E ON E.MATRICULA = C.CODFUNCCX
         WHERE C.POSICAO = 'L'
-          AND C.DATA >= TRUNC(:data_inicio)
+          AND C.DATA >= TRUNC(SYSDATE - 1/24)
         ORDER BY C.DATA, C.NUMPEDECF
     """
     with conn.cursor() as cur:
-        cur.execute(query, data_inicio=inicio_execucao)
+        cur.execute(query)
         colunas = [c[0] for c in cur.description]
         return [dict(zip(colunas, linha)) for linha in cur.fetchall()]
 
@@ -448,10 +451,11 @@ def carregar_template(nome_template: str) -> ModuleType:
 # ---------------------------------------------------------------------------
 
 def salvar_comanda(texto: str, num_pedido: Any, encoding: str) -> Path:
-    """Grava a comanda em processados/. O nome inclui o numero do pedido,
-    para que dois pedidos no mesmo segundo nao sobrescrevam um ao outro."""
-    carimbo = datetime.now().strftime("%Y%m%d_%H%M%S")
-    caminho_txt = PROCESSADOS_DIR / f"comanda_{num_pedido}_{carimbo}.txt"
+    """Grava a comanda em processados/. O nome usa o numero do pedido, para
+    que dois pedidos no mesmo segundo nao sobrescrevam um ao outro e para
+    que novas tentativas de impressao do mesmo pedido (impressora
+    desligada) reaproveitem o mesmo arquivo em vez de criar um por ciclo."""
+    caminho_txt = PROCESSADOS_DIR / f"comanda_{num_pedido}.txt"
 
     with open(caminho_txt, "w", encoding=encoding, errors="replace") as f:
         f.write(texto)
@@ -462,8 +466,11 @@ def salvar_comanda(texto: str, num_pedido: Any, encoding: str) -> Path:
 
 def enviar_para_impressora(caminho_txt: Path, nome_impressora: str) -> None:
     """Imprime o .txt de forma RAW (direto no spooler) no Windows para evitar
-    margens e quebra de linhas indesejadas do Notepad em impressoras termicas."""
-    
+    margens e quebra de linhas indesejadas do Notepad em impressoras termicas.
+
+    Levanta OSError se a impressao falhar, para que o pedido NAO seja
+    marcado como impresso e seja tentado de novo no proximo ciclo."""
+
     if sys.platform != "win32":
         logger.warning("Impressao RAW suportada apenas no Windows. Usando fallback.")
         if not nome_impressora or nome_impressora.lower() == "default":
@@ -487,7 +494,7 @@ def enviar_para_impressora(caminho_txt: Path, nome_impressora: str) -> None:
     # GS V 1 (0x1D 0x56 0x01) ou ESC m (0x1B 0x6D)
     raw_data += b'\x1d\x56\x01\x1b\x6d'
 
-    winspool = ctypes.WinDLL('winspool.drv')
+    winspool = ctypes.WinDLL('winspool.drv', use_last_error=True)
 
     class DOC_INFO_1(ctypes.Structure):
         _fields_ = [("pDocName", ctypes.c_wchar_p),
@@ -534,34 +541,33 @@ def enviar_para_impressora(caminho_txt: Path, nome_impressora: str) -> None:
             if GetDefaultPrinter(buffer, ctypes.byref(size)):
                 nome_impressora = buffer.value
             else:
-                logger.error("Falha ao obter impressora padrao.")
-                return
+                raise OSError(f"Falha ao obter impressora padrao. Erro: {ctypes.get_last_error()}")
         else:
-            logger.error("Nenhuma impressora padrao configurada.")
-            return
+            raise OSError("Nenhuma impressora padrao configurada no Windows.")
 
     hPrinter = wintypes.HANDLE()
     if not OpenPrinter(nome_impressora, ctypes.byref(hPrinter), None):
-        logger.error("Falha ao abrir impressora '%s'. Erro: %s", nome_impressora, ctypes.GetLastError())
-        return
-        
+        raise OSError(f"Falha ao abrir impressora '{nome_impressora}'. Erro: {ctypes.get_last_error()}")
+
     try:
         doc_info = DOC_INFO_1(pDocName="AutoComanda", pOutputFile=None, pDatatype="RAW")
-        
+
         job_id = StartDocPrinter(hPrinter, 1, ctypes.byref(doc_info))
         if not job_id:
-            logger.error("Falha em StartDocPrinter. Erro: %s", ctypes.GetLastError())
-            return
-            
+            raise OSError(f"Falha em StartDocPrinter. Erro: {ctypes.get_last_error()}")
+
         try:
             if not StartPagePrinter(hPrinter):
-                logger.error("Falha em StartPagePrinter. Erro: %s", ctypes.GetLastError())
-                return
-                
+                raise OSError(f"Falha em StartPagePrinter. Erro: {ctypes.get_last_error()}")
+
             try:
                 written = wintypes.DWORD(0)
                 if not WritePrinter(hPrinter, raw_data, len(raw_data), ctypes.byref(written)):
-                    logger.error("Falha em WritePrinter. Erro: %s", ctypes.GetLastError())
+                    raise OSError(f"Falha em WritePrinter. Erro: {ctypes.get_last_error()}")
+                if written.value != len(raw_data):
+                    raise OSError(
+                        f"WritePrinter enviou {written.value} de {len(raw_data)} bytes."
+                    )
             finally:
                 EndPagePrinter(hPrinter)
         finally:
@@ -591,6 +597,7 @@ def processar_pedido(
     config: dict[str, Any],
     template_mod: ModuleType,
     pedido: dict[str, Any],
+    sem_itens: dict[str, int],
 ) -> None:
     num_pedido = pedido["NUMPED"]
 
@@ -598,6 +605,23 @@ def processar_pedido(
         return
 
     itens = buscar_itens_pedido(ora_conn, num_pedido, config)
+
+    if not itens:
+        # O cabecalho pode ficar liberado antes dos itens serem gravados:
+        # espera alguns ciclos antes de dar o pedido por encerrado.
+        chave = str(num_pedido)
+        sem_itens[chave] = sem_itens.get(chave, 0) + 1
+        if sem_itens[chave] < MAX_CICLOS_SEM_ITENS:
+            return
+        logger.warning(
+            "Pedido %s continua sem itens apos %d ciclos; registrado sem imprimir.",
+            num_pedido, sem_itens[chave],
+        )
+        del sem_itens[chave]
+        marcar_processado(historico, num_pedido, qtd_itens=0, impresso=False)
+        return
+    sem_itens.pop(str(num_pedido), None)
+
     itens_preparo = filtrar_itens_preparo(itens, config)
 
     if not itens_preparo:
@@ -637,6 +661,7 @@ def processar_pedidos(
     template_mod: ModuleType,
     pedidos: list[dict[str, Any]],
     falhas: dict[str, int],
+    sem_itens: dict[str, int],
 ) -> None:
     """Processa cada pedido isoladamente: um pedido com erro nao impede
     os seguintes. Depois de MAX_TENTATIVAS_PEDIDO falhas o pedido e
@@ -646,7 +671,7 @@ def processar_pedidos(
     for pedido in pedidos:
         num_pedido = str(pedido["NUMPED"])
         try:
-            processar_pedido(ora_conn, historico, config, template_mod, pedido)
+            processar_pedido(ora_conn, historico, config, template_mod, pedido, sem_itens)
         except oracledb.DatabaseError:
             raise
         except Exception:
@@ -676,7 +701,6 @@ def executar() -> None:
     print("=" * 60)
     print("Monitorando novos Pedidos... Pressione Ctrl+C para sair.\n")
 
-    inicio_execucao = datetime.now()
     logger.info("=== AutoComanda iniciado ===")
     logger.debug("Diretorio base: %s", BASE_DIR)
 
@@ -684,14 +708,12 @@ def executar() -> None:
     template_mod = carregar_template(config["template"])
     historico = abrir_historico()
 
-    # Limpeza de dados antigos ao iniciar
-    purgar_historico_antigo(historico, dias=int(config["dias_historico"]))
-    limpar_comandas_antigas(dias=int(config["dias_comandas_txt"]))
-
     intervalo_segundos = int(config["intervalo_verificacao_segundos"])
 
     ora_conn: Optional[oracledb.Connection] = None
     falhas: dict[str, int] = {}
+    sem_itens: dict[str, int] = {}
+    dia_ultima_limpeza = None
 
     # A consulta busca desde o inicio do dia (a coluna DATA nao tem hora).
     # Se o AutoComanda ainda nao rodou hoje (instalacao nova ou PDV ligado
@@ -704,11 +726,19 @@ def executar() -> None:
 
     while True:
         try:
+            # Limpeza de dados antigos ao iniciar e a cada virada de dia
+            # (o PDV pode ficar varios dias sem reiniciar).
+            hoje = datetime.now().date()
+            if dia_ultima_limpeza != hoje:
+                purgar_historico_antigo(historico, dias=int(config["dias_historico"]))
+                limpar_comandas_antigas(dias=int(config["dias_comandas_txt"]))
+                dia_ultima_limpeza = hoje
+
             if ora_conn is None:
                 ora_conn = conectar_oracle(config)
                 logger.info("Conectado com sucesso.")
 
-            pedidos = buscar_pedidos_faturados(ora_conn, config, inicio_execucao)
+            pedidos = buscar_pedidos_faturados(ora_conn, config)
 
             if ignorar_pendentes:
                 ignorados = 0
@@ -722,7 +752,7 @@ def executar() -> None:
                     "registrados sem imprimir.", ignorados,
                 )
             else:
-                processar_pedidos(ora_conn, historico, config, template_mod, pedidos, falhas)
+                processar_pedidos(ora_conn, historico, config, template_mod, pedidos, falhas, sem_itens)
 
         except oracledb.DatabaseError:
             logger.exception("Erro de conexao/consulta. Reconectando no proximo ciclo.")
